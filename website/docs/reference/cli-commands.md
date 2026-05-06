@@ -320,6 +320,50 @@ hermes status [--all] [--deep]
 | `--all` | Show all details in a shareable redacted format. |
 | `--deep` | Run deeper checks that may take longer. |
 
+## `coding-agent-profile`
+
+`coding-agent-profile` is a companion executable for preparing isolated Codex and Claude Code CLI account profiles. It manages only non-secret directory metadata and environment variables; it does not copy, parse, or print OAuth tokens.
+
+```bash
+# Prepare the default 4-account pool now. They remain not_authenticated until login.
+coding-agent-profile init-pool
+# Creates: codex/main, codex/sub1, claude/main, claude/sub1
+
+# Or create a single project/profile label.
+coding-agent-profile codex create shortfe
+coding-agent-profile claude create hrm
+
+# Print the environment or login command to authenticate later.
+coding-agent-profile codex env shortfe
+coding-agent-profile claude login-command hrm
+
+# Ask for a profile priority recommendation by task type.
+coding-agent-profile recommend --task coding
+# codex/main -> codex/sub1 -> claude/main -> claude/sub1
+coding-agent-profile recommend --task review
+# claude/main -> claude/sub1 -> codex/main -> codex/sub1
+
+# Run a CLI command with a specific profile environment.
+coding-agent-profile codex run shortfe -- codex exec "say OK"
+coding-agent-profile claude run hrm -- claude -p "say OK"
+
+# Retry within one provider on quota/rate-limit style failures.
+coding-agent-profile codex rotate --profiles main,sub1 -- codex exec "run tests"
+
+# Retry across all 4 accounts with task-aware provider commands.
+coding-agent-profile run-policy --task coding --prompt "run tests"
+coding-agent-profile run-policy --task review --prompt "review this branch"
+```
+
+Default paths:
+
+- Codex: `~/.coding-agent-profiles/codex/<label>` via `CODEX_HOME`
+- Claude Code: `~/.coding-agent-profiles/claude/<label>/home` via isolated `HOME`
+- Default 4-account pool: `codex/main`, `codex/sub1`, `claude/main`, `claude/sub1`
+- Non-secret state: `~/.coding-agent-profiles/state.json`
+
+Use `CODING_AGENT_PROFILES_HOME=/path` or `--root /path` to relocate the profile root. Kanban/Byobu integrations should log only profile labels such as `codex/shortfe`, never auth file contents, emails, tokens, or organization identities.
+
 ## `hermes cron`
 
 ```bash
