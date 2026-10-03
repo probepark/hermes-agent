@@ -1256,6 +1256,11 @@ def max_retries_exhausted_result(
         # Present only for billing walls: (provider, billing_url, is_nous, message).
         "billing_block": _billing_block,
     })
+    _cooldown_context = getattr(classified, "error_context", None) or {}
+    if isinstance(_cooldown_context, dict) and _cooldown_context.get("cooldown_kind"):
+        result["cooldown_kind"] = _cooldown_context["cooldown_kind"]
+        if _cooldown_context.get("reset_at") is not None:
+            result["reset_after"] = _cooldown_context["reset_at"]
     # Retry-exhaustion after partial delivery (#119001): the text was already
     # shown, so keep it as the reply (marked failed) instead of an error-only
     # turn — the gateway flags ``partial`` and surfaces retain the bubble.
@@ -1704,7 +1709,9 @@ def _cap_long_context_tier(agent: Any) -> int:
     return old_ctx
 
 
-def _eager_fallback_status(classified: Any, is_upstream: bool, is_transport_failure: bool) -> str:
+def _eager_fallback_status(
+    classified: Any, is_upstream: bool, is_transport_failure: bool, is_cooldown: bool = False,
+) -> str:
     """Status line announcing an eager fallback switch."""
     if is_upstream:
         _upstream_name = (classified.error_context or {}).get("upstream_provider", "aggregator")
@@ -1720,6 +1727,8 @@ def _eager_fallback_status(classified: Any, is_upstream: bool, is_transport_fail
         return "⚠️ Billing or credits exhausted — switching to fallback provider..."
     if is_transport_failure:
         return "⚠️ Provider unreachable — switching to fallback provider..."
+    if is_cooldown:
+        return "⚠️ Provider model cooldown / quota exhausted — switching to fallback provider..."
     return "⚠️ Rate limited — switching to fallback provider..."
 
 
@@ -1911,12 +1920,22 @@ def route_classified_error(
         # upstream-aggregator 429 — the pool can't help, always fall back.
         # Fixes #11314.
         _is_upstream = classified.reason == FailoverReason.upstream_rate_limit
+        _classified_context = getattr(classified, "error_context", None)
+        _is_cooldown = bool(
+            isinstance(_classified_context, dict) and _classified_context.get("cooldown")
+        )
         pool_may_recover = (
-            False if _is_upstream else _ra()._pool_may_recover_from_rate_limit(agent._credential_pool)
+            False if (_is_upstream or _is_cooldown) else _ra()._pool_may_recover_from_rate_limit(agent._credential_pool)
         )
         if not pool_may_recover:
-            agent._buffer_diagnostic_status(_eager_fallback_status(classified, _is_upstream, _is_transport_failure))
-            reset_at = error_context.get("reset_at") if isinstance(error_context, dict) else None
+            agent._buffer_diagnostic_status(
+                _eager_fallback_status(classified, _is_upstream, _is_transport_failure, _is_cooldown)
+            )
+            reset_at = (
+                _classified_context.get("reset_at")
+                if isinstance(_classified_context, dict) and _classified_context.get("reset_at") is not None
+                else (error_context.get("reset_at") if isinstance(error_context, dict) else None)
+            )
             if agent._try_activate_fallback(reason=classified.reason, reset_at=reset_at):
                 return _fallback_break()
 

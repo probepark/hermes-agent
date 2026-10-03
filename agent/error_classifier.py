@@ -1050,6 +1050,10 @@ def _status_429(c: _Ctx) -> Verdict:
     # A structured billing code is decisive: LiteLLM stamps
     # ``terminal_quota_exhausted`` (a hard cap, not throttling) on 429s, and
     # this handler always returns, so _by_error_code never sees the code.
+    cooldown_kind = _cooldown_kind(c)
+    if cooldown_kind is not None:
+        reset = _rate_limit_reset_seconds(c.msg, c.body, c.headers)
+        return _rate_limit_verdict(reset, cooldown_kind=cooldown_kind)
     if c.code in _BILLING_ERROR_CODES:
         return _V_BILLING
     # Z.AI/Zhipu reuse 429 for server-wide overload: back off on the same
@@ -1073,8 +1077,8 @@ def _status_429(c: _Ctx) -> Verdict:
         return _V_BILLING
     # Carry the reset window so the terminal copy can name it instead of "wait a minute" (#89401).
     reset = _rate_limit_reset_seconds(c.msg, c.body, c.headers)
-    if reset:
-        return _v(_R.rate_limit, **_ROTATE_FALLBACK, error_context={"reset_at": time.time() + reset})
+    if reset is not None:
+        return _rate_limit_verdict(reset)
     return _V_RATE_LIMIT
 
 
@@ -1228,6 +1232,30 @@ _STATUS_HANDLERS: Dict[int, Callable[[_Ctx], Verdict]] = {
 
 _RESET_FIELDS = ("resets_in_seconds", "resets_at", "reset_at", "retry_after")
 _RESET_HEADERS = ("retry-after", "Retry-After", "x-ratelimit-reset", "X-RateLimit-Reset")
+
+
+_COOLDOWN_CODES = {"model_cooldown": "model_cooldown", "credential_quota": "credential_quota"}
+
+
+def _cooldown_kind(c: _Ctx) -> Optional[str]:
+    """Return the cooldown scope for a structured code or its message fallback."""
+    kind = _COOLDOWN_CODES.get(c.code)
+    if kind is not None:
+        return kind
+    for code, scope in _COOLDOWN_CODES.items():
+        if code in c.msg:
+            return scope
+    return None
+
+
+def _rate_limit_verdict(reset: Optional[float], *, cooldown_kind: Optional[str] = None) -> Verdict:
+    """Build a 429 verdict, retaining both reset forms for downstream recovery/copy."""
+    context: Dict[str, Any] = {}
+    if cooldown_kind is not None:
+        context.update(cooldown=True, cooldown_kind=cooldown_kind)
+    if reset is not None:
+        context.update(reset_seconds=reset, reset_at=time.time() + reset)
+    return _v(_R.rate_limit, **_ROTATE_FALLBACK, error_context=context) if context else _V_RATE_LIMIT
 
 
 def _has_usage_limit_transient_signal(error_msg: str, body: dict, response_headers) -> bool:

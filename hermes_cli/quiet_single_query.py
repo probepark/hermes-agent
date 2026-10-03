@@ -30,13 +30,18 @@ _MAX_QUIET_NOTIFY_ROUNDS = 8
 KANBAN_WORKER_EXIT_TRAILER = "[kanban-worker-exit] rc="
 
 
-def exit_single_query(code: int) -> None:
+def exit_single_query(code: int, *, reset_after: float | None = None, cooldown_kind: str | None = None) -> None:
     """``sys.exit(code)`` for a one-shot turn; a Kanban worker first writes the exit trailer to its log."""
     if os.environ.get("HERMES_KANBAN_TASK"):
         with contextlib.suppress(Exception):
             # stderr: stdout may be the ``--stream-json`` record stream, and the worker log
             # captures both streams.
-            print(f"\n{KANBAN_WORKER_EXIT_TRAILER}{int(code)}", file=sys.stderr, flush=True)
+            trailer = f"\n{KANBAN_WORKER_EXIT_TRAILER}{int(code)}"
+            if reset_after is not None:
+                trailer += f" reset_after={float(reset_after):.6f}"
+            if cooldown_kind:
+                trailer += f" cooldown_kind={cooldown_kind}"
+            print(trailer, file=sys.stderr, flush=True)
     sys.exit(code)
 
 

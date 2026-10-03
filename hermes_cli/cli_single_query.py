@@ -190,6 +190,17 @@ def _single_query_exit_code(result, *, credentials_rate_limited: bool = False,
     return 1
 
 
+def _single_query_cooldown_metadata(result) -> dict:
+    """Return structured provider cooldown metadata for the Kanban exit trailer."""
+    if not isinstance(result, dict) or result.get("failure_reason") != "rate_limit":
+        return {}
+    kind = result.get("cooldown_kind")
+    reset_after = result.get("reset_after") or result.get("failure_resets_at")
+    if kind not in {"model_cooldown", "credential_quota"}:
+        return {}
+    return {"cooldown_kind": kind, "reset_after": reset_after} if reset_after is not None else {"cooldown_kind": kind}
+
+
 def _run_quiet_single_query(cli, effective_query, emitter=None):
     """Quiet (-Q) one-shot turn: run, print the response (stderr for errors/session_id), then sys.exit with the automation exit code.
     With a ``StreamJsonEmitter`` the final answer and the exit line become the terminal ``result`` JSONL record instead.
@@ -336,7 +347,7 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
 
     if emitter is not None:
         _exit_code = emitter.emit_result(result, session_id=cli.session_id or "", exit_code=_exit_code)
-    exit_single_query(_exit_code)
+    exit_single_query(_exit_code, **_single_query_cooldown_metadata(result))
 
 
 def _route_single_query_images(cli, query, effective_query, single_query_images, single_query_image_urls):

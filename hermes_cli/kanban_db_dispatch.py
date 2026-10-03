@@ -145,6 +145,7 @@ class DispatchResult:
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
     a failure — a long quota window must never trip the circuit breaker."""
+    cooldown_parked: list[str] = field(default_factory=list)
     skipped_locked: bool = False
     """True when another process held the board's dispatch lock: this tick did
     no DB writes; the lock holder is making progress on the same board."""
@@ -173,6 +174,8 @@ def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
             counts[reason] = counts.get(reason, 0) + 1
         if res.rate_limited:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
+        if res.cooldown_parked:
+            counts["cooldown_parked"] = counts.get("cooldown_parked", 0) + len(res.cooldown_parked)
         if res.skipped_locked:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
         if res.memory_pressure:
@@ -258,7 +261,9 @@ def _exit_code_kind(code: int) -> "tuple[str, int]":
 
 
 _EXIT_TRAILER_RE = re.compile(
-    r"^" + re.escape(KANBAN_WORKER_EXIT_TRAILER) + r"(\d+)\s*$", re.MULTILINE,
+    r"^" + re.escape(KANBAN_WORKER_EXIT_TRAILER)
+    + r"(?P<code>\d+)(?:\s+reset_after=(?P<reset_after>[0-9.eE+-]+))?"
+    r"(?:\s+cooldown_kind=(?P<cooldown_kind>[A-Za-z0-9_.-]+))?\s*$", re.MULTILINE,
 )
 
 
@@ -274,8 +279,29 @@ def _worker_log_exit_code(task_id: str, board: Optional[str] = None) -> Optional
         raw = _kb.read_worker_log(task_id, tail_bytes=4000, board=board)
     except Exception:
         return None
-    matches = _EXIT_TRAILER_RE.findall(raw or "")
-    return int(matches[-1]) if matches else None
+    matches = list(_EXIT_TRAILER_RE.finditer(raw or ""))
+    return int(matches[-1].group("code")) if matches else None
+
+
+def _worker_log_exit_metadata(task_id: str, board: Optional[str] = None) -> dict:
+    """Read optional cooldown fields from the worker's durable exit trailer."""
+    try:
+        raw = _kb.read_worker_log(task_id, tail_bytes=4000, board=board)
+    except Exception:
+        return {}
+    matches = list(_EXIT_TRAILER_RE.finditer(raw or ""))
+    if not matches:
+        return {}
+    match = matches[-1]
+    metadata = {}
+    if match.group("reset_after"):
+        try:
+            metadata["reset_after"] = float(match.group("reset_after"))
+        except ValueError:
+            pass
+    if match.group("cooldown_kind"):
+        metadata["cooldown_kind"] = match.group("cooldown_kind")
+    return metadata
 
 
 def reap_worker_zombies() -> "list[int]":
@@ -945,7 +971,7 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     ).fetchall()
     for row in rows:
         outcome = row["outcome"] or ""
-        if outcome == "rate_limited":
+        if outcome in {"rate_limited", "cooldown_parked"}:
             continue
         if outcome == "crashed" and (
             _kb._json_dict(row["metadata"]).get("protocol_violation")
@@ -1034,6 +1060,7 @@ class _DeadWorker:
     protocol_violation: bool = False
     rate_limited: bool = False
     terminal_provider: bool = False
+    cooldown_parked: bool = False
     """``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``: the provider rejected the worker's
     credential/model — trips the breaker on this first occurrence."""
 
@@ -1041,6 +1068,8 @@ class _DeadWorker:
     def run_outcome(self) -> str:
         # A rate-limited requeue is recorded as ``rate_limited`` so board history
         # doesn't show a phantom crash for a quota wall.
+        if self.cooldown_parked:
+            return "cooldown_parked"
         return "rate_limited" if self.rate_limited else "crashed"
 
 
@@ -1078,6 +1107,9 @@ def _classify_dead_worker_exit(
     epilogue (killed, OOM) leaves no trailer and stays a plain crash.
     """
     kind, code = _classify_worker_exit(pid)
+    trailer_metadata = {}
+    if task_id:
+        trailer_metadata = _worker_log_exit_metadata(task_id, board=board)
     if kind == "unknown" and task_id:
         logged = _worker_log_exit_code(task_id, board=board)
         if logged is not None:
@@ -1097,6 +1129,18 @@ def _classify_dead_worker_exit(
     if kind == "rate_limited":
         # Quota wall — NOT a task failure. Release to the source phase and do
         # NOT count a failure so a long quota window can't trip the breaker.
+        if trailer_metadata.get("cooldown_kind") in {"model_cooldown", "credential_quota"}:
+            reset_after = trailer_metadata.get("reset_after")
+            if not isinstance(reset_after, (int, float)) or reset_after <= time.time():
+                reset_after = time.time() + 15 * 60
+            payload = {"pid": pid, "claimer": claimer, "exit_code": code,
+                       "reset_after": float(reset_after),
+                       "cooldown_kind": trailer_metadata["cooldown_kind"]}
+            return _DeadWorker(
+                kind, code,
+                f"pid {pid} exited during {trailer_metadata['cooldown_kind']} cooldown — parked until {reset_after:.0f}",
+                "cooldown_parked", payload, cooldown_parked=True,
+            )
         return _DeadWorker(
             kind, code,
             f"pid {pid} exited rate-limited (quota wall) — requeued without counting a failure",
@@ -1135,6 +1179,7 @@ class _CrashSweep:
 
     crashed: list[str] = field(default_factory=list)
     rate_limited: list[str] = field(default_factory=list)
+    cooldown_parked: list[str] = field(default_factory=list)
     # ``(task_id, pid, claimer, dead_worker)``: accounted after the txn via
     # ``_record_task_failure`` (needs its own write_txn).
     crash_details: list[tuple[str, int, str, _DeadWorker]] = field(default_factory=list)
@@ -1195,7 +1240,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 "outcome": dead.run_outcome,
                 "retry_status": retry_status,
             })
-            if dead.rate_limited or dead.protocol_violation:
+            if dead.rate_limited or dead.cooldown_parked or dead.protocol_violation:
                 # Stamp last_failure_error WITHOUT touching ``consecutive_failures``:
                 # a rate-limited requeue must show ``check_respawn_guard`` a quota
                 # blocker; a below-budget protocol violation never reaches
@@ -1207,6 +1252,8 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 )
             if dead.rate_limited:
                 sweep.rate_limited.append(row["id"])
+            elif dead.cooldown_parked:
+                sweep.cooldown_parked.append(row["id"])
             else:
                 sweep.crashed.append(row["id"])
                 sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
@@ -1311,6 +1358,7 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
     # requeues did NOT count a failure and are NOT crashes.
     detect_crashed_workers._last_auto_blocked = auto_blocked  # type: ignore[attr-defined]
     detect_crashed_workers._last_rate_limited = sweep.rate_limited  # type: ignore[attr-defined]
+    detect_crashed_workers._last_cooldown_parked = sweep.cooldown_parked  # type: ignore[attr-defined]
     # Fired only now, after the reclaim txn AND breaker accounting have
     # committed, so subscribers always observe fully durable board state.
     if sweep.exited_hook_payloads and _kb._kanban_observer_consumed("on_kanban_worker_exited"):
@@ -1569,7 +1617,12 @@ def check_respawn_guard(
             ended_at = latest_run["ended_at"]
             if ended_at is not None and (now - int(ended_at)) < rl_cooldown:
                 return "infrastructure_cooldown"
-    if latest_run is not None and latest_run["outcome"] == "rate_limited":
+    if latest_run is not None and latest_run["outcome"] in {"rate_limited", "cooldown_parked"}:
+        if latest_run["outcome"] == "cooldown_parked":
+            reset_after = _kb._json_dict(latest_run["metadata"]).get("reset_after")
+            if isinstance(reset_after, (int, float)) and now < float(reset_after):
+                return "cooldown_parked"
+            return None
         if rl_cooldown <= 0:
             # Cooldown disabled — respawn immediately, skipping blocker_auth so
             # the stamped rate-limit text doesn't re-trap the task.
@@ -2201,6 +2254,7 @@ def _run_reclaim_phase(
     # went back to ``ready`` and the respawn guard defers them until quota clears.
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
+    result.cooldown_parked.extend(getattr(detect_crashed_workers, "_last_cooldown_parked", []))
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
