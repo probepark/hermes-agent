@@ -900,6 +900,22 @@ def _by_error_code(c: _Ctx) -> Optional[Verdict]:
     return verdict
 
 
+def _structured_cooldown(c: _Ctx) -> Optional[Verdict]:
+    """Classify quota/rate-limit cooldown codes before provider hooks.
+
+    Relays commonly preserve these codes while changing provider/model names;
+    their reset metadata and neutral recovery semantics must not depend on a
+    provider profile recognizing the model family.
+    """
+    cooldown_kind = _cooldown_kind(c)
+    if cooldown_kind is None:
+        return None
+    return _rate_limit_verdict(
+        _rate_limit_reset_seconds(c.msg, c.body, c.headers),
+        cooldown_kind=cooldown_kind,
+    )
+
+
 def _by_message(c: _Ctx) -> Optional[Verdict]:
     """Message patterns when no status code settled it; status-less usage
     limits get the same disambiguation as 402."""
@@ -957,7 +973,7 @@ def _by_status(c: _Ctx) -> Optional[Verdict]:
 # HTTP status → MoA shapes → structured error code → message patterns → SSL → disconnect +
 # large session → transport types → unknown (retryable with backoff).
 _STAGES: Sequence[Callable[[_Ctx], Optional[Verdict]]] = (
-    _plugin_verdict, _profile_verdict, _provider_special_cases, _by_status, _moa_special_cases,
+    _structured_cooldown, _plugin_verdict, _profile_verdict, _provider_special_cases, _by_status, _moa_special_cases,
     _by_error_code, _by_message, _by_transport,
 )
 
@@ -1234,7 +1250,13 @@ _RESET_FIELDS = ("resets_in_seconds", "resets_at", "reset_at", "retry_after")
 _RESET_HEADERS = ("retry-after", "Retry-After", "x-ratelimit-reset", "X-RateLimit-Reset")
 
 
-_COOLDOWN_CODES = {"model_cooldown": "model_cooldown", "credential_quota": "credential_quota"}
+_COOLDOWN_CODES = {
+    "model_cooldown": "model_cooldown",
+    "credential_quota": "credential_quota",
+    # Anthropic uses this code, but relays and compatible providers use it too.
+    # It is a structured rate-limit signal, not a provider-specific verdict.
+    "rate_limit_error": "rate_limit_error",
+}
 
 
 def _cooldown_kind(c: _Ctx) -> Optional[str]:

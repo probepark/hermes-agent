@@ -196,7 +196,7 @@ def _single_query_cooldown_metadata(result) -> dict:
         return {}
     kind = result.get("cooldown_kind")
     reset_after = result.get("reset_after") or result.get("failure_resets_at")
-    if kind not in {"model_cooldown", "credential_quota"}:
+    if kind not in {"model_cooldown", "credential_quota", "rate_limit_error"}:
         return {}
     return {"cooldown_kind": kind, "reset_after": reset_after} if reset_after is not None else {"cooldown_kind": kind}
 

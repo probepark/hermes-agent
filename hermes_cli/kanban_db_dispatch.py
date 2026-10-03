@@ -1129,7 +1129,7 @@ def _classify_dead_worker_exit(
     if kind == "rate_limited":
         # Quota wall — NOT a task failure. Release to the source phase and do
         # NOT count a failure so a long quota window can't trip the breaker.
-        if trailer_metadata.get("cooldown_kind") in {"model_cooldown", "credential_quota"}:
+        if trailer_metadata.get("cooldown_kind") in {"model_cooldown", "credential_quota", "rate_limit_error"}:
             reset_after = trailer_metadata.get("reset_after")
             if not isinstance(reset_after, (int, float)) or reset_after <= time.time():
                 reset_after = time.time() + 15 * 60

@@ -1936,6 +1936,24 @@ def route_classified_error(
                 if isinstance(_classified_context, dict) and _classified_context.get("reset_at") is not None
                 else (error_context.get("reset_at") if isinstance(error_context, dict) else None)
             )
+            if _is_cooldown:
+                # A provider-declared model/quota cooldown is authoritative. Do not spend
+                # the generic retry budget (or an opt-in reset deferral) on a known-dead
+                # route; try the next configured model exactly once.
+                fallback_result = agent._try_activate_fallback(
+                    reason=classified.reason, reset_at=reset_at,
+                )
+                context = dict(_classified_context or {})
+                context.update(
+                    model=str(model),
+                    reset_at=reset_at,
+                    caller=effective_task_id or "conversation",
+                    fallback_result=bool(fallback_result),
+                )
+                agent._cooldown_recovery_metadata = context
+                if fallback_result:
+                    return _fallback_break()
+                return _verdict("break")
             if agent._try_activate_fallback(reason=classified.reason, reset_at=reset_at):
                 return _fallback_break()
 
