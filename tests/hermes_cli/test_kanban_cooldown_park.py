@@ -45,3 +45,23 @@ def test_cooldown_exit_is_parked_until_reset(kanban_home):
         assert metadata["reset_after"] == pytest.approx(reset, abs=1e-3)
         assert kbd._protocol_violation_streak(conn, tid) == 0
         assert kbd.check_respawn_guard(conn, tid) == "cooldown_parked"
+
+
+def test_rate_limit_error_exit_is_parked_without_protocol_violation(kanban_home):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="rate-limit", assignee="a")
+        host = kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, tid, claimer=f"{host}:w124")
+        conn.execute("UPDATE tasks SET worker_pid=?, worker_started_at=NULL, started_at=? WHERE id=?", (124, int(time.time()) - 120, tid))
+        conn.commit()
+        log = kb.worker_log_path(tid)
+        log.parent.mkdir(parents=True, exist_ok=True)
+        reset = time.time() + 600
+        log.write_text(f"{KANBAN_WORKER_EXIT_TRAILER}{kb.KANBAN_RATE_LIMIT_EXIT_CODE} reset_after={reset} cooldown_kind=rate_limit_error\n")
+
+        assert kbd.detect_crashed_workers(conn) == []
+        run = conn.execute("SELECT outcome, metadata FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
+        assert run["outcome"] == "cooldown_parked"
+        assert kb._json_dict(run["metadata"])["cooldown_kind"] == "rate_limit_error"
+        assert kb.get_task(conn, tid).consecutive_failures == 0
+        assert kbd._protocol_violation_streak(conn, tid) == 0

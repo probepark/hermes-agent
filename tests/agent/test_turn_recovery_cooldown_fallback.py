@@ -96,3 +96,23 @@ def test_normal_rate_limit_retains_pool_recovery_behavior():
     pool_recover.assert_called_once_with(agent._credential_pool)
     assert verdict.action == "fallthrough"
     assert agent.fallback_calls == []
+
+
+def test_rate_limit_error_cooldown_fallback_records_safe_metadata():
+    agent = _Agent()
+    classified = _classified(cooldown=True)
+    classified.error_context.update({"cooldown_kind": "rate_limit_error"})
+
+    with patch("run_agent._pool_may_recover_from_rate_limit", return_value=True):
+        verdict = _route(agent, classified)
+
+    assert verdict.action == "break"
+    assert agent.fallback_calls == [{"reason": FailoverReason.rate_limit, "reset_at": 1234}]
+    assert agent._cooldown_recovery_metadata == {
+        "cooldown": True,
+        "reset_at": 1234,
+        "cooldown_kind": "rate_limit_error",
+        "model": "model",
+        "caller": "conversation",
+        "fallback_result": True,
+    }
